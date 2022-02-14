@@ -1,4 +1,5 @@
 import random
+from functools import partial
 from typing import (
     Callable,
     Iterable,
@@ -55,6 +56,101 @@ __all__ = (
 )
 
 
+def _load_and_concat_metapartitions_inner(mps, args, kwargs):
+    return MetaPartition.concat_metapartitions(
+        [mp.load_dataframes(*args, **kwargs) for mp in mps]
+    )
+
+
+def _load_dataframe(
+    mp,
+    *args,
+    **kwargs,
+):
+    if isinstance(mp, list):
+        return pd.concat(
+            m.data
+            for m in _load_and_concat_metapartitions_inner(
+                mp,
+                args=args,
+                kwargs=kwargs,
+            )
+        )
+    else:
+        return mp.load_dataframes(
+            *args,
+            **kwargs,
+        ).data
+
+
+def _read_dataset_hlg(
+    dataset_uuid=None,
+    store=None,
+    columns=None,
+    predicate_pushdown_to_io=True,
+    categoricals: Optional[Sequence[str]] = None,
+    dates_as_object: bool = True,
+    predicates=None,
+    factory=None,
+    dask_index_on=None,
+    dispatch_by=None,
+):
+    from dask.blockwise import blockwise, BlockwiseDepDict, Blockwise
+    from dask.layers import DataFrameIOLayer
+    from dask.highlevelgraph import HighLevelGraph
+    from dask.dataframe.core import new_dd_object
+
+    ds_factory = _ensure_factory(
+        dataset_uuid=dataset_uuid,
+        store=store,
+        factory=factory,
+    )
+
+    store = ds_factory.store_factory
+    meta = _get_dask_meta_for_dataset(
+        ds_factory, columns, categoricals, dates_as_object
+    )
+
+    if columns is None:
+        columns = list(meta.columns)
+
+    mps = list(
+        dispatch_metapartitions_from_factory(
+            dataset_factory=ds_factory,
+            predicates=predicates,
+            dispatch_by=dispatch_by,
+        )
+    )
+    name = "plateau-read-dataset"
+    io_func = partial(
+        _load_dataframe,
+        store=store,
+        columns=columns,
+        categoricals=categoricals,
+        predicate_pushdown_to_io=predicate_pushdown_to_io,
+        dates_as_object=dates_as_object,
+        predicates=predicates,
+    )
+    layer = DataFrameIOLayer(
+        name=name,
+        columns=columns,
+        io_func=io_func,
+        inputs=mps,
+    )
+    graph = HighLevelGraph({name: layer}, {name: set()})
+    if dask_index_on:
+        divisions = ds_factory.indices[dask_index_on].observed_values()
+        divisions.sort()
+        divisions = list(divisions)
+        divisions.append(divisions[-1])
+        return dd.from_delayed(
+            delayed_partitions, meta=meta, divisions=divisions
+        ).set_index(dask_index_on, divisions=divisions, sorted=True)
+    else:
+        divisions = (None,) * (len(mps) + 1)
+    return new_dd_object(graph, name, meta, divisions)
+
+
 @default_docs
 @normalize_args
 def read_dataset_as_ddf(
@@ -104,13 +200,15 @@ def read_dataset_as_ddf(
 
     if isinstance(columns, dict):
         columns = columns[table]
-    meta = _get_dask_meta_for_dataset(
-        ds_factory, columns, categoricals, dates_as_object
+    return _read_dataset_hlg(
+        factory=ds_factory,
+        columns=columns,
+        predicate_pushdown_to_io=predicate_pushdown_to_io,
+        categoricals=categoricals,
+        dates_as_object=dates_as_object,
+        predicates=predicates,
+        dispatch_by=dask_index_on if dask_index_on else dispatch_by,
     )
-
-    if columns is None:
-        columns = list(meta.columns)
-
     # that we can use factories instead of dataset_uuids
     delayed_partitions = read_dataset_as_delayed(
         factory=ds_factory,
